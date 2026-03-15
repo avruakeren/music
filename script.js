@@ -1,3 +1,5 @@
+const API = 'http://localhost:8000';
+
 const els = {
   searchInput: document.getElementById('searchInput'),
   resultMeta: document.getElementById('resultMeta'),
@@ -31,34 +33,112 @@ const state = {
   isSearchMode: false
 };
 
-// Piped instances to try in order
-const PIPED_INSTANCES = [
-  'https://pipedapi.adminforge.de',
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.privacy.com.de'
-];
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
-function formatTime(value) {
-  if (!Number.isFinite(value)) return '0:00';
-  const minute = Math.floor(value / 60);
-  const second = Math.floor(value % 60).toString().padStart(2, '0');
-  return `${minute}:${second}`;
+function formatTime(secs) {
+  if (!Number.isFinite(secs) || secs < 0) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+// ─── YouTube via local backend ────────────────────────────────────────────────
+
+async function searchYouTube(query) {
+  const requestId = ++state.requestId;
+  els.resultMeta.textContent = 'Mencari di YouTube...';
+  state.isSearchMode = true;
+  state.searchResults = [];
+  renderView();
+
+  try {
+    const res = await fetch(`${API}/search?q=${encodeURIComponent(query)}&limit=15`);
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    const data = await res.json();
+
+    if (requestId !== state.requestId) return;
+
+    const tracks = (data.results || []).map(t => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      durationLabel: t.duration ? formatTime(t.duration) : '--:--',
+      artwork: t.thumbnail,
+      src: null // resolved on play
+    }));
+
+    if (!tracks.length) {
+      els.resultMeta.textContent = 'Tidak ada hasil. Coba keyword lain.';
+      renderView(); return;
+    }
+
+    state.searchResults = tracks;
+    els.resultMeta.textContent = `${tracks.length} lagu ditemukan`;
+    renderView();
+    loadAndPlay(0, false);
+
+  } catch (err) {
+    if (requestId !== state.requestId) return;
+    console.error(err);
+    els.resultMeta.textContent = `Gagal connect ke server. Pastikan server.py berjalan. (${err.message})`;
+    renderView();
+  }
+}
+
+async function resolveAndPlay(index, autoPlay = true) {
+  const track = state.queue[index];
+  if (!track) return;
+
+  if (track.src) {
+    // already resolved
+    setAudioSrc(track, autoPlay);
+    return;
+  }
+
+  els.resultMeta.textContent = `Memuat stream "${track.title}"...`;
+  try {
+    const res = await fetch(`${API}/stream/${encodeURIComponent(track.id)}`);
+    if (!res.ok) throw new Error(`Stream error: ${res.status}`);
+    const data = await res.json();
+    track.src = data.url;
+    setAudioSrc(track, autoPlay);
+    els.resultMeta.textContent = `${state.searchResults.length} lagu ditemukan`;
+  } catch (err) {
+    console.error(err);
+    els.resultMeta.textContent = `Gagal load stream: ${err.message}`;
+  }
+}
+
+function setAudioSrc(track, autoPlay) {
+  els.audio.src = track.src;
+  els.currentTime.textContent = '0:00';
+  els.duration.textContent = track.durationLabel || '--:--';
+  els.progress.value = 0;
+  setNowPlaying(track);
+  renderView();
+  if (autoPlay) playAudio();
+  else pauseAudio();
+}
+
+function loadAndPlay(index, autoPlay = true) {
+  if (!state.queue.length) return;
+  state.currentIndex = Math.max(0, Math.min(index, state.queue.length - 1));
+  resolveAndPlay(state.currentIndex, autoPlay);
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────────
 
 function renderSearchResults() {
-  const tracks = state.searchResults;
   els.recentGrid.classList.add('hidden');
   els.resultsList.classList.remove('hidden');
   els.sectionHeading.textContent = 'Search Results';
 
-  if (!tracks.length) {
+  if (!state.searchResults.length) {
     els.resultsList.innerHTML = `<li class="track"><div class="meta"><strong>Belum ada hasil</strong><small>Coba keyword lain.</small></div></li>`;
     return;
   }
 
-  els.resultsList.innerHTML = tracks.map((track, idx) => {
+  els.resultsList.innerHTML = state.searchResults.map((track, idx) => {
     const badge = track.artwork
       ? `<img class="badge" src="${track.artwork}" alt="${track.title}" />`
       : '<div class="badge">🎵</div>';
@@ -68,15 +148,16 @@ function renderSearchResults() {
         ${badge}
         <div class="meta">
           <strong>${track.title}</strong>
-          <small>${track.artist || 'Unknown Artist'}</small>
+          <small>${track.artist}</small>
         </div>
-        <span>${track.durationLabel || '--:--'}</span>
+        <span>${track.durationLabel}</span>
       </li>`;
   }).join('');
 
   els.resultsList.querySelectorAll('.track[data-index]').forEach(row => {
     row.addEventListener('click', () => {
-      playFromList(state.searchResults, Number(row.dataset.index));
+      state.queue = state.searchResults;
+      loadAndPlay(Number(row.dataset.index));
     });
   });
 }
@@ -93,15 +174,18 @@ function renderRecent() {
 
   els.recentGrid.innerHTML = state.recentPlays.slice(0, 6).map((track, idx) => `
     <button class="recent-item" data-index="${idx}">
-      ${track.artwork ? `<img class="recent-thumb" src="${track.artwork}" alt="${track.title}" />` : '<div class="recent-thumb">🎵</div>'}
+      ${track.artwork
+        ? `<img class="recent-thumb" src="${track.artwork}" alt="${track.title}" />`
+        : '<div class="recent-thumb">🎵</div>'}
       <strong>${track.title}</strong>
-      <span>${track.artist || 'Unknown Artist'}</span>
+      <span>${track.artist}</span>
     </button>
   `).join('');
 
-  els.recentGrid.querySelectorAll('[data-index]').forEach(button => {
-    button.addEventListener('click', () => {
-      playFromList(state.recentPlays, Number(button.dataset.index));
+  els.recentGrid.querySelectorAll('[data-index]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.queue = state.recentPlays;
+      loadAndPlay(Number(btn.dataset.index));
     });
   });
 }
@@ -122,30 +206,16 @@ function setNowPlaying(track) {
     : '#232327';
 }
 
-function playFromList(list, index, autoPlay = true) {
-  if (!list.length) return;
-  state.queue = list;
-  state.currentIndex = Math.max(0, Math.min(index, list.length - 1));
-  const track = state.queue[state.currentIndex];
-  els.audio.src = track.src;
-  els.currentTime.textContent = '0:00';
-  els.duration.textContent = track.durationLabel || '--:--';
-  els.progress.value = 0;
-  setNowPlaying(track);
-  renderView();
-  if (autoPlay) playAudio();
-  else pauseAudio();
-}
-
 async function playAudio() {
   try {
     await els.audio.play();
     els.playBtn.textContent = '⏸';
     const track = state.queue[state.currentIndex];
     if (track) {
-      state.recentPlays = [track, ...state.recentPlays.filter(t => t.src !== track.src)].slice(0, 20);
+      state.recentPlays = [track, ...state.recentPlays.filter(t => t.id !== track.id)].slice(0, 20);
     }
-  } catch {
+  } catch (e) {
+    console.error(e);
     els.playBtn.textContent = '▶';
   }
 }
@@ -157,8 +227,7 @@ function pauseAudio() {
 
 function togglePlay() {
   if (!state.queue.length) return;
-  if (els.audio.paused) playAudio();
-  else pauseAudio();
+  els.audio.paused ? playAudio() : pauseAudio();
 }
 
 function nextTrack() {
@@ -166,13 +235,12 @@ function nextTrack() {
   const next = state.isShuffle
     ? Math.floor(Math.random() * state.queue.length)
     : (state.currentIndex + 1) % state.queue.length;
-  playFromList(state.queue, next, true);
+  loadAndPlay(next);
 }
 
 function prevTrack() {
   if (!state.queue.length) return;
-  const prev = (state.currentIndex - 1 + state.queue.length) % state.queue.length;
-  playFromList(state.queue, prev, true);
+  loadAndPlay((state.currentIndex - 1 + state.queue.length) % state.queue.length);
 }
 
 function updateProgress() {
@@ -189,117 +257,19 @@ function seekTrack() {
   els.audio.currentTime = (Number(els.progress.value) / 100) * els.audio.duration;
 }
 
-// ─── YouTube via Piped ────────────────────────────────────────────────────────
-
-function parseVideoId(urlLike = '') {
-  try {
-    const full = new URL(urlLike, 'https://youtube.com');
-    return full.searchParams.get('v') || full.pathname.split('/').filter(Boolean).pop() || '';
-  } catch {
-    return '';
-  }
-}
-
-function mapYoutubeTrack(video, streamUrl) {
-  return {
-    title: video.title || 'Untitled',
-    artist: video.uploaderName || video.uploader || 'YouTube',
-    durationLabel: Number(video.duration) ? formatTime(Number(video.duration)) : '--:--',
-    artwork: video.thumbnail || video.thumbnailUrl || '',
-    src: streamUrl
-  };
-}
-
-async function fetchFromInstance(instance, query) {
-  const res = await fetch(`${instance}/search?q=${encodeURIComponent(query)}&filter=music_songs`, {
-    signal: AbortSignal.timeout(8000)
-  });
-  const data = await res.json();
-  const items = (Array.isArray(data.items) ? data.items : [])
-    .filter(item => item.url || item.videoId)
-    .slice(0, 12);
-
-  const tracks = [];
-
-  for (const video of items) {
-    const id = video.videoId || parseVideoId(video.url);
-    if (!id) continue;
-    try {
-      const streamRes = await fetch(`${instance}/streams/${encodeURIComponent(id)}`, {
-        signal: AbortSignal.timeout(8000)
-      });
-      const streamData = await streamRes.json();
-      const audioStreams = Array.isArray(streamData.audioStreams) ? streamData.audioStreams : [];
-      const best = audioStreams
-        .filter(a => a.url && (!a.mimeType || /audio\//i.test(a.mimeType)))
-        .sort((a, b) => Number(b.bitrate || 0) - Number(a.bitrate || 0))[0];
-      if (best?.url) {
-        tracks.push(mapYoutubeTrack(video, best.url));
-      }
-    } catch {
-      // skip video if stream fetch fails
-    }
-  }
-
-  return tracks;
-}
-
-async function searchYouTube(query) {
-  const requestId = ++state.requestId;
-  els.resultMeta.textContent = 'Mencari di YouTube...';
-  state.isSearchMode = true;
-  state.searchResults = [];
-  renderView();
-
-  try {
-    let results = [];
-
-    for (const instance of PIPED_INSTANCES) {
-      try {
-        results = await fetchFromInstance(instance, query);
-        if (results.length) break;
-      } catch {
-        // try next instance
-      }
-    }
-
-    if (requestId !== state.requestId) return;
-
-    state.searchResults = results;
-
-    if (!results.length) {
-      els.resultMeta.textContent = 'Tidak ada hasil atau semua instance error. Coba keyword lain.';
-      renderView();
-      return;
-    }
-
-    els.resultMeta.textContent = `${results.length} lagu ditemukan dari YouTube`;
-    renderView();
-    playFromList(state.searchResults, 0, false);
-  } catch {
-    if (requestId !== state.requestId) return;
-    els.resultMeta.textContent = 'Search gagal. Coba lagi.';
-  }
-}
-
 function onSearchInput() {
   clearTimeout(state.debounceTimer);
   const keyword = els.searchInput.value.trim();
-
   if (!keyword) {
     state.searchResults = [];
     state.isSearchMode = false;
     els.resultMeta.textContent = 'Cari lagu di kolom search di atas.';
-    renderView();
-    return;
+    renderView(); return;
   }
-
-  state.debounceTimer = setTimeout(() => {
-    searchYouTube(keyword);
-  }, 450);
+  state.debounceTimer = setTimeout(() => searchYouTube(keyword), 500);
 }
 
-// ─── Event Listeners ──────────────────────────────────────────────────────────
+// ─── Events ───────────────────────────────────────────────────────────────────
 
 els.searchInput.addEventListener('input', onSearchInput);
 els.playBtn.addEventListener('click', togglePlay);
@@ -314,20 +284,13 @@ els.repeatBtn.addEventListener('click', () => {
   els.repeatBtn.classList.toggle('active', state.isRepeat);
 });
 els.progress.addEventListener('input', seekTrack);
-els.volume.addEventListener('input', () => {
-  els.audio.volume = Number(els.volume.value);
-});
-
+els.volume.addEventListener('input', () => { els.audio.volume = Number(els.volume.value); });
 els.audio.addEventListener('timeupdate', updateProgress);
 els.audio.addEventListener('loadedmetadata', updateProgress);
 els.audio.addEventListener('pause', () => { els.playBtn.textContent = '▶'; });
 els.audio.addEventListener('play', () => { els.playBtn.textContent = '⏸'; });
 els.audio.addEventListener('ended', () => {
-  if (state.isRepeat) {
-    els.audio.currentTime = 0;
-    playAudio();
-    return;
-  }
+  if (state.isRepeat) { els.audio.currentTime = 0; playAudio(); return; }
   nextTrack();
 });
 
@@ -336,3 +299,9 @@ els.audio.addEventListener('ended', () => {
 setNowPlaying(null);
 els.audio.volume = Number(els.volume.value);
 renderView();
+
+// Check server on load
+fetch(`${API}/health`)
+  .then(r => r.json())
+  .then(() => els.resultMeta.textContent = 'Server terhubung ✓ Cari lagu di atas.')
+  .catch(() => els.resultMeta.textContent = '⚠️ Server tidak terdeteksi. Jalankan server.py dulu.');
